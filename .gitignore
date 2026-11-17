@@ -713,3 +713,20 @@ software/script/nonces.bin
 firmware/compile_commands.json
 firmware/application/compile_commands.json
 software/src/target_arch_detect.c
+
+### Local AI assistant tooling (Claude Code / oh-my-claudecode) ###
+CLAUDE.md
+.claude/
+.omc/
+**/.omc/
+.mcp.json
+
+### Local data — never commit ###
+# Card dumps / captures from real tags
+dumps/
+# Firmware backups made before flashing
+firmware/backups/
+# venv created inside software/script
+software/script/lib/
+software/script/include/
+software/script/pyvenv.cfg

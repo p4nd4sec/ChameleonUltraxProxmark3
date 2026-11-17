@@ -1,3 +1,30 @@
+> [!NOTE]
+> **This is a personal fork of [RfidResearchGroup/ChameleonUltra](https://github.com/RfidResearchGroup/ChameleonUltra)**
+> that ports LF features from Proxmark3 to the Chameleon Ultra. It is not an official release.
+>
+> | | |
+> |---|---|
+> | Upstream | `https://github.com/RfidResearchGroup/ChameleonUltra` (branch `main`) |
+> | Forked from | [`6009a5f`](https://github.com/RfidResearchGroup/ChameleonUltra/commit/6009a5f) (2026-11-11, merge of PR #557) |
+> | Work branch | `feat/lf-t55xx-detect` |
+>
+> **What this fork adds** (full list under `[unreleased]` in [CHANGELOG.md](CHANGELOG.md)):
+> - `lf t55xx detect`: T55xx/T5577 modulation, bit rate and block 0 detection (new `LF_T55XX_READ_RAW` command)
+> - `lf em 4x05 info / write / wipe / clone --id`: EM4x05/EM4305 using Proxmark3 downlink framing (new `EM4X05_READ_RAW` and `EM4X05_WRITE_WORD` commands)
+> - Fixes `lf em 4x05 read` and raw LF captures (`lf sniff`, `lf generic adcread`) that were dropping samples
+> - Host-side demodulation in `software/script/{lf_demod,t55xx,em4x05}.py`, with unit tests in `software/script/tests/`
+>
+> **Comparing with / syncing from upstream:**
+> ```sh
+> git remote add upstream https://github.com/RfidResearchGroup/ChameleonUltra.git
+> git fetch upstream
+> git log --oneline upstream/main..HEAD   # commits that exist only in this fork
+> git diff upstream/main...HEAD --stat    # files this fork changes
+> git merge upstream/main                 # pull in new upstream changes
+> ```
+>
+> The new command IDs live in `data_cmd.h` / `chameleon_enum.py`. Check them for conflicts with upstream before merging.
+
 ![logo](docs/images/ultra-logo.png)
 
 ![ultra picture](docs/images/ultra-overview.png)
