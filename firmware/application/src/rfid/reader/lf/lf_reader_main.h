@@ -30,4 +30,6 @@ uint8_t write_jablotron_to_t55xx(uint8_t *uid, uint8_t *new_passwd, uint8_t *old
 uint8_t write_idteck_to_t55xx(uint8_t *data, uint8_t *new_passwd, uint8_t *old_passwds, uint8_t old_passwd_count);
 #if defined(PROJECT_CHAMELEON_ULTRA)
 uint8_t lf_t55xx_write_block(uint8_t block, uint32_t word, uint32_t passwd, bool use_passwd, bool page1);
+uint8_t lf_t55xx_read_block_raw(uint8_t block, uint32_t passwd, bool use_passwd, bool page1,
+                                uint8_t decimation, uint8_t *out, size_t maxlen, size_t *outlen);
 #endif

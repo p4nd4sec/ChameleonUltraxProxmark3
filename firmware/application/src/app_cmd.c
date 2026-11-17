@@ -19,6 +19,7 @@
 #include "bsp_wdt.h"
 #include "lf_reader_generic.h"
 #include "lf_em4x05_data.h"
+#include "lf_em4x05_raw.h"
 #include "rc522.h"
 #include "mf1_crapto1.h"
 #include "parity.h"
@@ -1091,6 +1092,103 @@ static data_frame_tx_t *cmd_processor_lf_t55xx_write(uint16_t cmd, uint16_t stat
 
     status = lf_t55xx_write_block(p->block, word, passwd, use_pwd, page1);
     return data_frame_make(cmd, status, 0, NULL);
+}
+
+/* Upper bound on samples averaged into one byte by the raw LF capture commands. */
+#define T55XX_READ_RAW_MAX_DECIMATION 8
+/* Shared by the raw LF capture commands (T55xx / EM4x05); commands never run concurrently. */
+static uint8_t m_lf_raw_buf[LF_SNIFF_MAX_SAMPLES];
+
+static data_frame_tx_t *cmd_processor_lf_t55xx_read_raw(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    typedef struct {
+        uint8_t block;       /* block number */
+        uint8_t page1;       /* 1 = page 1, 0 = page 0 */
+        uint8_t use_pwd;     /* 1 = password-mode read */
+        uint8_t pwd[4];      /* 32-bit password, big-endian (ignored when use_pwd == 0) */
+        uint8_t decimation;  /* samples averaged per returned byte, 1..8 */
+    } PACKED payload_t;
+
+    if (length != sizeof(payload_t)) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    payload_t *p = (payload_t *)data;
+    uint8_t max_block = p->page1 ? 3u : 7u;
+    if (p->block > max_block || p->decimation == 0 || p->decimation > T55XX_READ_RAW_MAX_DECIMATION) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+
+    size_t outlen = 0;
+    status = lf_t55xx_read_block_raw(p->block, bytes_to_num(p->pwd, 4), (bool)p->use_pwd, (bool)p->page1,
+                                     p->decimation, m_lf_raw_buf, sizeof(m_lf_raw_buf), &outlen);
+    return data_frame_make(cmd, status, (uint16_t)outlen, m_lf_raw_buf);
+}
+
+/* EM4x05 words are addressed 0..15. */
+#define EM4X05_MAX_WORD_ADDR 15
+
+static data_frame_tx_t *cmd_processor_em4x05_read_raw(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    typedef struct {
+        uint8_t addr;          /* word address 0..15 */
+        uint8_t use_pwd;       /* 1 = LOGIN with pwd before the READ */
+        uint8_t pwd[4];        /* 32-bit password, big-endian (ignored when use_pwd == 0) */
+        uint8_t decimation;    /* samples averaged per returned byte, 1..8 */
+        uint8_t start_gap_tc;  /* downlink timing overrides in carrier cycles, 0 = default */
+        uint8_t zero_gap_tc;
+        uint8_t field_on_tc;
+        uint8_t one_tc;
+    } PACKED payload_t;
+
+    if (length != sizeof(payload_t)) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    payload_t *p = (payload_t *)data;
+    if (p->addr > EM4X05_MAX_WORD_ADDR || p->decimation == 0 || p->decimation > T55XX_READ_RAW_MAX_DECIMATION) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+
+    em4x05_timing_t timing = {
+        .start_gap_tc = p->start_gap_tc,
+        .zero_gap_tc = p->zero_gap_tc,
+        .field_on_tc = p->field_on_tc,
+        .one_tc = p->one_tc,
+    };
+    size_t outlen = 0;
+    status = em4x05_read_word_raw(p->addr, (bool)p->use_pwd, bytes_to_num(p->pwd, 4), &timing,
+                                  p->decimation, m_lf_raw_buf, sizeof(m_lf_raw_buf), &outlen);
+    return data_frame_make(cmd, status, (uint16_t)outlen, m_lf_raw_buf);
+}
+
+static data_frame_tx_t *cmd_processor_em4x05_write_word(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    typedef struct {
+        uint8_t addr;          /* word address 0..13 (14/15 protection words are refused) */
+        uint8_t data[4];       /* 32-bit word, big-endian */
+        uint8_t use_pwd;       /* 1 = LOGIN with pwd before the WRITE */
+        uint8_t pwd[4];        /* 32-bit password, big-endian (ignored when use_pwd == 0) */
+        uint8_t decimation;    /* samples averaged per returned byte, 1..8 */
+        uint8_t start_gap_tc;  /* downlink timing overrides in carrier cycles, 0 = default */
+        uint8_t zero_gap_tc;
+        uint8_t field_on_tc;
+        uint8_t one_tc;
+    } PACKED payload_t;
+
+    if (length != sizeof(payload_t)) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    payload_t *p = (payload_t *)data;
+    if (p->addr > EM4X05_MAX_WRITABLE_ADDR || p->decimation == 0 || p->decimation > T55XX_READ_RAW_MAX_DECIMATION) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+
+    em4x05_timing_t timing = {
+        .start_gap_tc = p->start_gap_tc,
+        .zero_gap_tc = p->zero_gap_tc,
+        .field_on_tc = p->field_on_tc,
+        .one_tc = p->one_tc,
+    };
+    size_t outlen = 0;
+    status = em4x05_write_word_raw(p->addr, bytes_to_num(p->data, 4), (bool)p->use_pwd, bytes_to_num(p->pwd, 4),
+                                   &timing, p->decimation, m_lf_raw_buf, sizeof(m_lf_raw_buf), &outlen);
+    return data_frame_make(cmd, status, (uint16_t)outlen, m_lf_raw_buf);
 }
 
 #define GENERIC_READ_LEN 800
@@ -3306,6 +3404,9 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_PYRAMID_SCAN,                 before_reader_run,           cmd_processor_pyramid_scan,                  NULL                   },
     {    DATA_CMD_IDTECK_WRITE_TO_T55XX,        before_reader_run,           cmd_processor_idteck_write_to_t55xx,         NULL                   },
     {    DATA_CMD_LF_T55XX_WRITE,               before_reader_run,           cmd_processor_lf_t55xx_write,                NULL                   },
+    {    DATA_CMD_LF_T55XX_READ_RAW,            before_reader_run,           cmd_processor_lf_t55xx_read_raw,             NULL                   },
+    {    DATA_CMD_EM4X05_READ_RAW,              before_reader_run,           cmd_processor_em4x05_read_raw,               NULL                   },
+    {    DATA_CMD_EM4X05_WRITE_WORD,            before_reader_run,           cmd_processor_em4x05_write_word,             NULL                   },
     {    DATA_CMD_ADC_GENERIC_READ,             before_reader_run,           cmd_processor_generic_read,                  NULL                   },
 
     {    DATA_CMD_HF14A_SET_FIELD_ON,           before_reader_run,           cmd_processor_hf14a_set_field_on,            NULL                   },

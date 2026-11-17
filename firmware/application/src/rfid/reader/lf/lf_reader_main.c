@@ -6,6 +6,7 @@
 #include "hex_utils.h"
 #include "lf_125khz_radio.h"
 #include "lf_reader_data.h"
+#include "lf_reader_generic.h"
 #include "protocols/em410x.h"
 #include "protocols/ioprox.h"
 #include "protocols/hidprox.h"
@@ -257,6 +258,11 @@ uint8_t write_idteck_to_t55xx(uint8_t *data, uint8_t *new_passwd, uint8_t *old_p
 void set_scan_tag_timeout(uint32_t ms) { g_timeout_readem_ms = ms; }
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
+// Time for a T55xx to power up before it accepts a downlink command.
+#define T55XX_POWER_UP_MS 5
+// Upper bound for one raw capture (4000 samples x decimation 8 at 8us/sample is 256ms).
+#define T55XX_READ_CAPTURE_TIMEOUT_MS 400
+
 /**
  * Write a single raw 32-bit word to a T55xx block.
  *
@@ -285,5 +291,40 @@ uint8_t lf_t55xx_write_block(uint8_t block, uint32_t word, uint32_t passwd, bool
 
     stop_lf_125khz_radio();
     return STATUS_LF_TAG_OK;
+}
+
+/**
+ * Send a T55xx direct-access read for one block and capture the tag's answer as raw ADC samples.
+ *
+ * After a direct-access read the tag transmits the addressed block over and over
+ * using whatever modulation/bit rate block 0 configures.  Demodulation is done on
+ * the host (like Proxmark3 `lf t55xx detect`), so this only returns samples.
+ * Read-only: nothing is written to the tag.
+ *
+ * @param block      Block number (0-7 for page 0, 0-3 for page 1)
+ * @param passwd     Password for password-mode read (ignored when use_passwd is false)
+ * @param use_passwd true = password-mode read
+ * @param page1      true = page 1, false = page 0
+ * @param decimation Average this many consecutive samples per output byte (1 = full rate)
+ * @param out        Sample buffer
+ * @param maxlen     Size of out
+ * @param outlen     Number of samples written
+ * @return           STATUS_LF_TAG_OK when samples were captured, STATUS_LF_TAG_NO_FOUND otherwise
+ */
+uint8_t lf_t55xx_read_block_raw(uint8_t block, uint32_t passwd, bool use_passwd, bool page1,
+                                uint8_t decimation, uint8_t *out, size_t maxlen, size_t *outlen) {
+    uint8_t opcode = page1 ? T5577_OPCODE_PAGE1 : T5577_OPCODE_PAGE0;
+    uint32_t *pwd_ptr = use_passwd ? &passwd : NULL;
+
+    start_lf_125khz_radio();
+    bsp_delay_ms(T55XX_POWER_UP_MS);
+
+    // Direct access read: opcode, [password], lock bit 0, 3-bit address. Field is left on.
+    t55xx_send_cmd(opcode, pwd_ptr, 0, NULL, block);
+
+    *outlen = raw_capture_field_on(out, maxlen, decimation, T55XX_READ_CAPTURE_TIMEOUT_MS);
+
+    stop_lf_125khz_radio();
+    return *outlen > 0 ? STATUS_LF_TAG_OK : STATUS_LF_TAG_NO_FOUND;
 }
 #endif

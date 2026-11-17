@@ -859,6 +859,89 @@ class ChameleonCMD:
         timeout_s = (timeout_ms // 1000) + 2
         return self.device.send_cmd_sync(Command.LF_SNIFF, payload, timeout=timeout_s)
 
+    def lf_t55xx_read_raw(
+        self, block: int = 0, page1: bool = False, password: Union[int, None] = None, decimation: int = 1
+    ):
+        """
+        Send a T55xx direct-access read and capture the tag's answer as raw ADC samples.
+
+        Read-only. Demodulation happens on the host (see t55xx.detect_from_captures).
+
+        :param block: block number (0-7 on page 0, 0-3 on page 1)
+        :param page1: read page 1 instead of page 0
+        :param password: 32-bit password for a password-mode read, or None
+        :param decimation: samples averaged per returned byte (1-8); stretches the capture window
+        :return: Raw response object — check .status and .data (up to 4000 samples)
+        """
+        payload = struct.pack(
+            "!BBB4sB",
+            block,
+            int(page1),
+            int(password is not None),
+            (password or 0).to_bytes(4, "big"),
+            decimation,
+        )
+        return self.device.send_cmd_sync(Command.LF_T55XX_READ_RAW, payload, timeout=3)
+
+    def em4x05_read_raw(
+        self,
+        addr: int,
+        password: Union[int, None] = None,
+        decimation: int = 1,
+        timing: tuple = (0, 0, 0, 0),
+    ):
+        """
+        Send an EM4x05 READ (after LOGIN when a password is given) and capture the answer as raw ADC samples.
+
+        Read-only: the firmware path only supports READ and LOGIN.
+
+        :param addr: word address 0-15
+        :param password: 32-bit password for LOGIN, or None
+        :param decimation: samples averaged per returned byte (1-8)
+        :param timing: downlink (start_gap, zero_gap, field_on, one) in carrier cycles, 0 = Proxmark3 default
+        :return: Raw response object — check .status and .data (up to 4000 samples)
+        """
+        payload = struct.pack(
+            "!BB4sB4B",
+            addr,
+            int(password is not None),
+            (password or 0).to_bytes(4, "big"),
+            decimation,
+            *timing,
+        )
+        return self.device.send_cmd_sync(Command.EM4X05_READ_RAW, payload, timeout=3)
+
+    def em4x05_write_word(
+        self,
+        addr: int,
+        value: int,
+        password: Union[int, None] = None,
+        decimation: int = 1,
+        timing: tuple = (0, 0, 0, 0),
+    ):
+        """
+        WRITE one EM4x05 word (after LOGIN when a password is given) and capture the answer as raw samples.
+
+        The firmware refuses the protection words 14/15. Always verify by reading the word back.
+
+        :param addr: word address 0-13
+        :param value: 32-bit value
+        :param password: 32-bit password for LOGIN, or None
+        :param decimation: samples averaged per returned byte (1-8)
+        :param timing: downlink (start_gap, zero_gap, field_on, one) in carrier cycles, 0 = Proxmark3 default
+        :return: Raw response object — check .status
+        """
+        payload = struct.pack(
+            "!B4sB4sB4B",
+            addr,
+            value.to_bytes(4, "big"),
+            int(password is not None),
+            (password or 0).to_bytes(4, "big"),
+            decimation,
+            *timing,
+        )
+        return self.device.send_cmd_sync(Command.EM4X05_WRITE_WORD, payload, timeout=3)
+
     @expect_response(Status.LF_TAG_OK)
     def em4x05_scan(self, pwd: int = 0):
         """
@@ -869,15 +952,16 @@ class ChameleonCMD:
           uid       4 bytes  — EM4x05 UID
           uid_hi    4 bytes  — EM4x69 uid_hi (zero for plain EM4x05)
           is_em4x69 1 byte   — 1 if a 64-bit EM4x69 UID was read
-          uid_block 1 byte   — block number UID was read from
+
+        Legacy firmware decoder; `lf em 4x05 read/info` use em4x05_read_raw() instead.
 
         :param pwd: 32-bit password for LOGIN (default 0x00000000)
-        :return: parsed tuple (config, uid, uid_hi, is_em4x69, uid_block)
+        :return: parsed tuple (config, uid, uid_hi, is_em4x69)
         """
         pwd_bytes = struct.pack("!I", pwd & 0xFFFFFFFF)
         resp = self.device.send_cmd_sync(Command.EM4X05_SCAN, pwd_bytes)
         if resp.status == Status.LF_TAG_OK:
-            resp.parsed = struct.unpack("!IIIBB", resp.data[:14])
+            resp.parsed = struct.unpack("!IIIB", resp.data[:13])
         return resp
 
     @expect_response(Status.LF_TAG_OK)

@@ -3,6 +3,11 @@ All notable changes to this project will be documented in this file.
 This project uses the changelog in accordance with [keepchangelog](http://keepachangelog.com/). Please use this to write notable changes, which is not the same as git commit log...
 
 ## [unreleased][unreleased]
+ - Added `lf t55xx detect`: detect T55xx/T5577 modulation, bit rate and block 0 config (Proxmark3-style, host-side demodulation) via new read-only `LF_T55XX_READ_RAW` command
+ - Added `lf em 4x05 info`: read all EM4x05/EM4x69 words using Proxmark3 downlink framing (`0 0` + 4-bit cmd LSB-first + 6-bit address + parity) with host-side demodulation, via new read-only `EM4X05_READ_RAW` command; downlink timings tunable from the CLI
+ - Added `lf em 4x05 write`, `lf em 4x05 wipe` and `lf em 4x05 clone --id` (EM410x onto EM4305) via new `EM4X05_WRITE_WORD` command; every write is verified by reading back, words 0/1/14/15 and login-enabling configs are refused, PROTECT/DISABLE are not implemented
+ - Fixed `lf em 4x05 read`: never found EM4305 tags (wrong downlink framing/bit encoding/word addresses in the firmware decoder) and would crash on success (14-byte unpack of a 13-byte reply); it now uses the raw EM4x05 path and shows chip type, UID, config and the emulated EM410x ID, with `-p` password support
+ - Fixed raw LF captures (`lf sniff`, `lf generic adcread`) silently dropping ~75% of samples: 2048-sample SAADC blocks were pushed through a 512-entry circular buffer
  - Fix reset when BLE bonds are deleted while connected (@mfcarroll)
  - Fixed ISO14443-4 (T=CL) tag emulation silently truncating any received command of 32+ bytes (e.g. an EMV GPO with a full PDOL): `nfc_tag_14a_unwrap_frame` returned the data-bit count as `uint8_t`, wrapping it mod 256 (@whitewhidow)
 

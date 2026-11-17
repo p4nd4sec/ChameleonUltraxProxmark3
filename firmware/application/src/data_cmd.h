@@ -121,6 +121,9 @@
 #define DATA_CMD_JABLOTRON_SCAN                 (3019)
 #define DATA_CMD_JABLOTRON_WRITE_TO_T55XX       (3020)
 #define DATA_CMD_PYRAMID_SCAN                   (3021)
+#define DATA_CMD_LF_T55XX_READ_RAW              (3022)
+#define DATA_CMD_EM4X05_READ_RAW                (3023)
+#define DATA_CMD_EM4X05_WRITE_WORD              (3024)
 
 //
 // ******************************************************************

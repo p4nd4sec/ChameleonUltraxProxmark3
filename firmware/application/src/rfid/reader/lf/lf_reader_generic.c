@@ -4,7 +4,6 @@
 #include "bsp_delay.h"
 #include "bsp_wdt.h"
 #include "bsp_time.h"
-#include "circular_buffer.h"
 #include "lf_125khz_radio.h"
 #include "lf_reader_data.h"
 #include "protocols/protocols.h"
@@ -16,35 +15,56 @@
 NRF_LOG_MODULE_REGISTER();
 
 /*
- * Circular buffer for SAADC samples.
- * Increased from 128 to 512 to reduce overrun risk during USB transfer.
- * The main loop drains it as fast as possible into the output buffer.
+ * Samples are copied straight from the SAADC callback into the caller's buffer.
+ * The SAADC delivers 2048-sample DMA blocks; routing them through a small
+ * circular buffer dropped everything past its capacity (~75% of each block),
+ * which made captures discontinuous in time.
  */
-#define CIRCULAR_BUFFER_SIZE (512)
-static circular_buffer cb;
+static uint8_t *m_cap_buf;
+static size_t m_cap_max;
+static volatile size_t m_cap_len;
+static uint8_t m_cap_decimation;
+static uint32_t m_cap_acc;
+static uint8_t m_cap_acc_count;
 
-static void saadc_cb(nrf_saadc_value_t *vals, size_t size) {
-    for (int i = 0; i < size; i++) {
-        nrf_saadc_value_t val = vals[i];
-        if (!cb_push_back(&cb, &val)) {
-            return;  /* buffer full — oldest samples dropped */
+/* 14-bit ADC value -> 8-bit, clamped (kept identical to the historical conversion). */
+static inline uint8_t sample_to_u8(nrf_saadc_value_t v) {
+    uint16_t u = ((uint16_t)v) >> 5;
+    return u > 0xff ? 0xff : (uint8_t)u;
+}
+
+static void capture_cb(nrf_saadc_value_t *vals, size_t size) {
+    for (size_t i = 0; i < size && m_cap_len < m_cap_max; i++) {
+        m_cap_acc += sample_to_u8(vals[i]);
+        if (++m_cap_acc_count == m_cap_decimation) {
+            m_cap_buf[m_cap_len++] = (uint8_t)(m_cap_acc / m_cap_decimation);
+            m_cap_acc = 0;
+            m_cap_acc_count = 0;
         }
     }
 }
 
-static void init_saadc_hw(void) {
-    lf_125khz_radio_saadc_enable(saadc_cb);
-}
+size_t raw_capture_field_on(uint8_t *data, size_t maxlen, uint8_t decimation, uint32_t timeout_ms) {
+    m_cap_buf = data;
+    m_cap_max = maxlen;
+    m_cap_len = 0;
+    m_cap_decimation = decimation == 0 ? 1 : decimation;
+    m_cap_acc = 0;
+    m_cap_acc_count = 0;
 
-static void uninit_saadc_hw(void) {
+    lf_125khz_radio_saadc_enable(capture_cb);
+
+    autotimer *p_at = bsp_obtain_timer(0);
+    while (NO_TIMEOUT_1MS(p_at, timeout_ms) && m_cap_len < m_cap_max) {
+        bsp_wdt_feed();  /* prevent watchdog reset during long captures */
+    }
+    bsp_return_timer(p_at);
+
     lf_125khz_radio_saadc_disable();
+    return m_cap_len;
 }
 
 bool raw_read_to_buffer(uint8_t *data, size_t maxlen, uint32_t timeout_ms, size_t *outlen) {
-    *outlen = 0;
-
-    cb_init(&cb, CIRCULAR_BUFFER_SIZE, sizeof(uint16_t));
-    init_saadc_hw();
     start_lf_125khz_radio();
 
     /* Wait for antenna to settle before capturing.
@@ -52,21 +72,8 @@ bool raw_read_to_buffer(uint8_t *data, size_t maxlen, uint32_t timeout_ms, size_
      * another ~800µs to reach steady state. Skip 2ms to be safe. */
     bsp_delay_ms(2);
 
-    autotimer *p_at = bsp_obtain_timer(0);
-    while (NO_TIMEOUT_1MS(p_at, timeout_ms) && *outlen < maxlen) {
-        uint16_t val = 0;
-        while (cb_pop_front(&cb, &val) && *outlen < maxlen) {
-            val = val >> 5;  /* 14-bit ADC → 9-bit, then >>5 gives 8-bit */
-            data[*outlen] = val > 0xff ? 0xff : (uint8_t)val;
-            ++(*outlen);
-        }
-        bsp_wdt_feed();  /* prevent watchdog reset during long captures */
-    }
+    *outlen = raw_capture_field_on(data, maxlen, 1, timeout_ms);
 
-    bsp_return_timer(p_at);
     stop_lf_125khz_radio();
-    uninit_saadc_hw();
-    cb_free(&cb);
-
     return true;
 }

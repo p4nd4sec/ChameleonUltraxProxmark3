@@ -21,3 +21,12 @@
 #define LF_SNIFF_MAX_SAMPLES  4000
 
 bool raw_read_to_buffer(uint8_t *data, size_t maxlen, uint32_t timeout_ms, size_t *outlen);
+
+/*
+ * Capture raw ADC samples while the 125kHz field is already on (caller owns the field).
+ *
+ * Samples are written straight from the SAADC callback, so the capture is
+ * contiguous in time.  With decimation > 1, each output byte is the average of
+ * `decimation` consecutive samples, stretching the capture window accordingly.
+ */
+size_t raw_capture_field_on(uint8_t *data, size_t maxlen, uint8_t decimation, uint32_t timeout_ms);

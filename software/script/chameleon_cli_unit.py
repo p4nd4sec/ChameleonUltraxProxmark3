@@ -20,6 +20,8 @@ from typing import Union
 from platform import uname
 from datetime import datetime
 import hardnested_utils
+import t55xx
+import em4x05
 
 import chameleon_com
 import chameleon_cmd
@@ -950,6 +952,7 @@ lf_jablotron = lf.subgroup("jablotron", "Jablotron commands")
 lf_generic = lf.subgroup("generic", "Generic commands")
 lf_idteck = lf.subgroup("idteck", "IDTECK commands")
 lf_pyramid = lf.subgroup("pyramid", "Farpointe/Pyramid commands")
+lf_t55xx = lf.subgroup("t55xx", "T55xx/T5577 commands")
 
 
 @root.command("clear")
@@ -7969,36 +7972,251 @@ examples/notes:
             print(f" [*] {color_string((CY, 'No response'))}")
 
 
+def _parse_em4x05_password(pwd):
+    if pwd is None:
+        return None
+    if not re.fullmatch(r"[0-9a-fA-F]{8}", pwd):
+        raise ArgsParserError("Password must be exactly 8 hex digits")
+    return int(pwd, 16)
+
+
+class LFEm4x05Unit(ReaderRequiredUnit):
+    """Shared EM4x05 helpers: Proxmark3 framing, host-side decoding, reads confirmed by agreement."""
+
+    MAX_READS = 6
+    AGREEMENT = 2
+
+    @staticmethod
+    def add_common_args(parser):
+        parser.add_argument("-p", "--pwd", type=str, default=None, metavar="<hex>", help="Password (8 hex) to LOGIN first")
+        timing = parser.add_argument_group("downlink timing in carrier cycles (0 = Proxmark3 default)")
+        timing.add_argument("--start-gap", type=int, default=0, metavar="TC", help="start gap (default 55)")
+        timing.add_argument("--zero-gap", type=int, default=0, metavar="TC", help="'0' bit gap (default 23)")
+        timing.add_argument("--field-on", type=int, default=0, metavar="TC", help="field on after a gap (default 18)")
+        timing.add_argument("--one", type=int, default=0, metavar="TC", help="'1' bit length (default 32)")
+
+    @staticmethod
+    def common_args(args):
+        timing = (args.start_gap, args.zero_gap, args.field_on, args.one)
+        if not all(0 <= v <= 255 for v in timing):
+            raise ArgsParserError("Timing values must be 0-255 carrier cycles")
+        return _parse_em4x05_password(args.pwd), timing
+
+    def read_word(self, addr, password, timing, captures=None):
+        """Read until the same value (or refusal) is decoded AGREEMENT times; returns (result, confirmed)."""
+        tally: dict = {}
+        for _ in range(self.MAX_READS):
+            resp = self.cmd.em4x05_read_raw(addr, password, 1, timing)
+            if resp.status == Status.INVALID_CMD:
+                raise ArgsParserError("This firmware has no EM4X05_READ_RAW command; update the firmware.")
+            if resp.status != Status.LF_TAG_OK or not resp.data:
+                continue
+            samples = bytes(resp.data)
+            if captures is not None:
+                captures.setdefault(str(addr), []).append(list(samples))
+            res = em4x05.decode_word_samples(samples)
+            if res is None:
+                continue
+            key = None if res.error else res.word
+            tally[key] = (tally.get(key, (0, res))[0] + 1, res)
+            if tally[key][0] >= self.AGREEMENT:
+                return res, True
+        if tally:
+            _, res = max(tally.values(), key=lambda t: t[0])
+            return res, False
+        return None, False
+
+    def read_confirmed(self, addr, password, timing):
+        res, confirmed = self.read_word(addr, password, timing)
+        return res.word if res is not None and confirmed and not res.error else None
+
+    def write_verified(self, addr, value, password, timing):
+        """WRITE one word (guarded), then read it back. Returns the confirmed read-back value or None."""
+        refusal = em4x05.write_refusal(addr, value)
+        if refusal:
+            raise ArgsParserError(refusal)
+        resp = self.cmd.em4x05_write_word(addr, value, password, 1, timing)
+        if resp.status == Status.INVALID_CMD:
+            raise ArgsParserError("This firmware has no EM4X05_WRITE_WORD command; update the firmware.")
+        if resp.status == Status.PAR_ERR:
+            raise ArgsParserError(f"Firmware refused to write word {addr}")
+        return self.read_confirmed(addr, password, timing)
+
+    def write_plan(self, plan, password, timing):
+        """Write (addr, value) pairs in order, verifying each; stops at the first mismatch."""
+        for addr, value in plan:
+            old = self.read_confirmed(addr, password, timing)
+            got = self.write_verified(addr, value, password, timing)
+            old_text = "????????" if old is None else f"{old:08X}"
+            if got == value:
+                print(f" word {addr:<3} {old_text} -> {CG}{value:08X}{C0}  verified")
+            else:
+                got_text = "no answer" if got is None else f"{got:08X}"
+                print(f" word {addr:<3} {old_text} -> {CR}{value:08X} FAILED (read back {got_text}){C0}")
+                print(f"{CR} Stopped. Words after {addr} were not written.{C0}")
+                return False
+        return True
+
+
 @lf_em_4x05.command("read")
-class LFEm4x05Read(ReaderRequiredUnit):
+class LFEm4x05Read(LFEm4x05Unit):
     def args_parser(self) -> ArgumentParserNoExit:
         parser = ArgumentParserNoExit()
         parser.description = (
-            "Scan EM4x05 or EM4x69 tag (reader-talk-first) and print config, UID"
+            "Identify an EM4x05/EM4x69 tag: chip type, UID, config and the EM410x ID it emulates. "
+            "Read-only (Proxmark3 framing, host-side demodulation). Use `lf em 4x05 info` for all 16 words."
         )
+        self.add_common_args(parser)
         return parser
 
     def on_exec(self, args: argparse.Namespace):
-        try:
-            pwd = int(args.pwd, 16) if hasattr(args, "pwd") and args.pwd else 0
-        except ValueError:
-            print(f"{CR}Invalid password, expected hex{C0}")
+        password, timing = self.common_args(args)
+        config = self.read_confirmed(em4x05.WORD_CONFIG, password, timing)
+        if config is None:
+            print(f"{CR}No EM4x05/EM4x69 tag found{C0} (or it needs a password: -p <hex>).")
             return
-        (config, uid, uid_hi, is_em4x69, uid_block) = self.cmd.em4x05_scan(pwd=pwd)
-        tag_label = "EM4x69" if is_em4x69 else "EM4x05"
-        rl = bool((config >> 6) & 1)
-        print(f" Tag type : {CG}{tag_label}{C0}")
-        print(f" Config   : {CG}{config:#010x}{C0}")
-        print(f" UID block: {CG}{uid_block}{C0}")
-        if rl:
-            print(
-                f" Auth     : {CG}LOGIN used (pwd={args.pwd.upper() if hasattr(args, 'pwd') and args.pwd else '00000000'}){C0}"
-            )
-        if is_em4x69:
-            uid64 = (uid_hi << 32) | uid
-            print(f" UID (64) : {CG}{uid64:016x}{C0}")
+        chip = self.read_confirmed(em4x05.WORD_INFO, password, timing)
+        uid = self.read_confirmed(em4x05.WORD_UID, password, timing)
+        cfg = em4x05.decode_config(config)
+
+        if chip is not None:
+            info = em4x05.decode_chip_info(chip)
+            print(f" Chip type : {CG}{info.name}{C0}")
+            print(f" Chip info : {chip:08X}  (capacitor {info.capacitor}, customer code "
+                  f"{'default' if info.default_customer_code else hex(info.customer_code)})")
         else:
-            print(f" UID      : {CG}{uid:08x}{C0}")
+            print(f" Chip type : {CY}unknown (word 0 not readable){C0}")
+        print(f" UID       : {CG}{uid:08X}{C0}" if uid is not None else f" UID       : {CY}not readable{C0}")
+        print(f" Config    : {CG}{config:08X}{C0}  RF/{cfg.data_rate}, {cfg.encoder_name}, "
+              f"last word read {cfg.last_word_read}, read login {'on' if cfg.read_login else 'off'}, "
+              f"write login {'on' if cfg.write_login else 'off'}")
+
+        if config == em4x05.CONFIG_EM_UNIQUE:
+            w5 = self.read_confirmed(5, password, timing)
+            w6 = self.read_confirmed(6, password, timing)
+            if w5 is None or w6 is None:
+                print(f" Emulates  : {CY}EM410x config, but words 5/6 were not confirmed; retry{C0}")
+            else:
+                em_id = em4x05.em410x_id_from_words(w5, w6)
+                print(f" Emulates  : {CG}EM410x {em_id}{C0}" if em_id else
+                      f" Emulates  : {CY}EM410x config, words 5/6 hold no valid EM410x frame{C0}")
+
+
+@lf_em_4x05.command("info")
+class LFEm4x05Info(LFEm4x05Unit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Read EM4x05/EM4x69 words with Proxmark3-compatible framing and host-side demodulation. "
+            "Read-only: only READ and LOGIN are ever sent."
+        )
+        parser.add_argument("-a", "--addr", type=int, default=None, metavar="<0-15>", help="Read only this word")
+        parser.add_argument("--save", type=str, default=None, metavar="FILE", help="Save words and raw captures as JSON")
+        self.add_common_args(parser)
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        password, timing = self.common_args(args)
+        if args.addr is not None and not 0 <= args.addr <= 15:
+            raise ArgsParserError("Word address must be 0-15")
+
+        addrs = [args.addr] if args.addr is not None else list(range(16))
+        captures: dict = {}
+        words: dict = {}
+        print(f" {'Word':<5}{'Name':<26}Value")
+        for addr in addrs:
+            res, confirmed = self.read_word(addr, password, timing, captures)
+            name = em4x05.WORD_NAMES.get(addr, "user data")
+            note = "" if confirmed else f"  {CY}(single read, unconfirmed){C0}"
+            if res is None:
+                text = f"{CY}no answer{C0}"
+            elif res.error:
+                text = f"{CY}refused (protected / login needed){C0}{note}"
+            else:
+                text = f"{CG}{res.word:08X}{C0}  (RF/{res.clock}){note}"
+                if confirmed:
+                    words[addr] = res.word
+            print(f" {addr:<5}{name:<26}{text}")
+
+        if em4x05.WORD_INFO in words:
+            print(f" Chip type: {em4x05.decode_chip_info(words[em4x05.WORD_INFO]).name}")
+        if em4x05.WORD_CONFIG in words:
+            cfg = em4x05.decode_config(words[em4x05.WORD_CONFIG])
+            print(f" Config: RF/{cfg.data_rate}, {cfg.encoder_name}, last word read {cfg.last_word_read}, "
+                  f"read login {'on' if cfg.read_login else 'off'}, write login {'on' if cfg.write_login else 'off'}")
+        if not words:
+            print(f"{CY}No EM4x05 answer. Not an EM4x05/EM4x69, badly positioned, or downlink timing needs tuning.{C0}")
+
+        if args.save:
+            import json
+
+            with open(args.save, "w") as f:
+                json.dump({"words": {str(a): w for a, w in words.items()}, "captures": captures}, f)
+            print(f" Saved to {args.save}")
+
+
+@lf_em_4x05.command("write")
+class LFEm4x05Write(LFEm4x05Unit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Write one EM4x05/EM4x69 word and verify it by reading back. "
+            "Words 0 (chip info), 1 (UID) and 14/15 (protection) are never written; "
+            "configs enabling read/write login are refused."
+        )
+        parser.add_argument("-a", "--addr", type=int, required=True, metavar="<2-13>", help="Word address")
+        parser.add_argument("-d", "--data", type=str, required=True, metavar="<hex>", help="32-bit value, 8 hex digits")
+        self.add_common_args(parser)
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        password, timing = self.common_args(args)
+        if not re.fullmatch(r"[0-9a-fA-F]{8}", args.data):
+            raise ArgsParserError("Data must be exactly 8 hex digits")
+        self.write_plan([(args.addr, int(args.data, 16))], password, timing)
+
+
+@lf_em_4x05.command("wipe")
+class LFEm4x05Wipe(LFEm4x05Unit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Wipe an EM4305: zero words 2, 3, 5-13 and set config 0001805F (EM/unique, no login). "
+            "Chip info, UID and protection words are left untouched. Run `lf em 4x05 info --save` first as a backup."
+        )
+        self.add_common_args(parser)
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        password, timing = self.common_args(args)
+        if self.read_confirmed(em4x05.WORD_CONFIG, password, timing) is None:
+            raise ArgsParserError("No confirmed EM4x05 answer (config word); not wiping.")
+        if self.write_plan(em4x05.wipe_plan(), password, timing):
+            print(f" {CG}Wipe complete.{C0}")
+
+
+@lf_em_4x05.command("clone")
+class LFEm4x05Clone(LFEm4x05Unit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Program an EM410x ID onto an EM4305 (like Proxmark3 `lf em 410x clone --em`): "
+            "words 6, 5, then config 0001805F, each verified by reading back."
+        )
+        parser.add_argument("--id", type=str, required=True, metavar="<hex>", help="EM410x ID, 10 hex digits")
+        self.add_common_args(parser)
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        password, timing = self.common_args(args)
+        try:
+            words = em4x05.em410x_clone_words(args.id)
+        except ValueError as e:
+            raise ArgsParserError(str(e))
+        if self.read_confirmed(em4x05.WORD_CONFIG, password, timing) is None:
+            raise ArgsParserError("No confirmed EM4x05 answer (config word); not writing.")
+        if self.write_plan(list(words.items()), password, timing):
+            print(f" {CG}EM410x {args.id.upper()} cloned to EM4305.{C0} Check with `lf em 410x read`.")
 
 
 @lf.command("sniff")
@@ -8108,6 +8326,61 @@ class LFSniff(ReaderRequiredUnit):
 
 
 @hf_14a.command("info")
+@lf_t55xx.command("detect")
+class LFT55xxDetect(ReaderRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Detect T55xx/T5577 modulation, bit rate and config (block 0), "
+            "like Proxmark3 `lf t55xx detect`. Read-only: nothing is written to the tag."
+        )
+        parser.add_argument(
+            "-p", "--pwd", type=str, default=None, metavar="<hex>", help="Password (8 hex digits) for a password-mode read"
+        )
+        parser.add_argument(
+            "--save", type=str, default=None, metavar="FILE", help="Save the raw captures as JSON for offline analysis"
+        )
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        password = None
+        if args.pwd is not None:
+            if not re.fullmatch(r"[0-9a-fA-F]{8}", args.pwd):
+                raise ArgsParserError("Password must be exactly 8 hex digits")
+            password = int(args.pwd, 16)
+
+        captures = {}
+        for decimation in t55xx.DECIMATIONS:
+            resp = self.cmd.lf_t55xx_read_raw(block=0, password=password, decimation=decimation)
+            if resp.status == Status.INVALID_CMD:
+                print(f"{CR}This firmware has no raw T55xx read (LF_T55XX_READ_RAW); update the firmware.{C0}")
+                return
+            if resp.status != Status.LF_TAG_OK or not resp.data:
+                print(f"{CR}No samples captured.{C0}")
+                return
+            captures[decimation] = bytes(resp.data)
+
+        if args.save:
+            import json
+
+            with open(args.save, "w") as f:
+                json.dump({str(d): list(samples) for d, samples in captures.items()}, f)
+            print(f" Raw captures saved to {args.save}")
+
+        result = t55xx.detect_from_captures(captures)
+        if result is None:
+            print(f"{CY}Could not detect a T55xx config block.{C0}")
+            print(" Possible reasons:")
+            print("  - not a T55xx/T5577 (e.g. a read-only EM4100 keeps sending its ID)")
+            print("  - the tag is password protected: retry with -p <password>")
+            print("  - PSK modulation or a bit rate the detector does not support yet")
+            print("  - the tag is badly positioned: move it and retry")
+            return
+
+        for line in t55xx.describe(result, password):
+            print(f" {line}")
+
+
 @hf_14a.command("sniff")
 class HF14ASniff(BaseCLIUnit):
     def args_parser(self) -> ArgumentParserNoExit:
